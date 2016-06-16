@@ -13,7 +13,7 @@ logOnConsole = False
 def log(str):
 	global logOnConsole
 	if logOnConsole:
-		print str	
+		print str
 
 def initializeDir(dirname):
 	if not os.path.isdir(dirname):
@@ -43,13 +43,13 @@ def cmpImages(img1, img2):
 		return False
 	# next check the result of perceptual diff
 	try:
-		args = ['perceptualdiff', '-downsample', '3', '-colorfactor', '0', img1, img2]
-		subprocess.check_output(args, shell=False)
+		cmd = 'perceptualdiff -downsample 3 -colorfactor 0 {0} {1}'.format(img1, img2)
+		subprocess.check_output(cmd.split(), shell=False)
 		return True
 	except subprocess.CalledProcessError:
 		return False
 	except OSError:
-		print 'Error running perceptualdiff'
+		print 'Error running perceptualdiff. Run apt-get install perceptualdiff.'
 		return False
 
 def freeDiskSpace(dir):
@@ -63,15 +63,47 @@ def freeDiskSpace(dir):
 			log('freeing disk-space by deleting: {0}'.format(canDelete[0]))
 			shutil.rmtree(canDelete[0])
 		else:
-			break		
+			break
 
 def killProc(proc):
 	if proc:
 		proc.terminate()
 
+def encodeTimelapseVideo(dir, fps):
+	# create symbolic link for *.jpg
+	# this is to workaround avconv issue with handling input file list
+	images = sorted(glob.glob('{0}/*.jpg'.format(dir)))
+	i=0
+	for img in images:
+		slnk = '{0}/img{1:0>6}.jpg'.format(dir, i)
+		log('symlink {0} --> {1}'.format(img, slnk))
+		try:
+			os.symlink(os.path.abspath(img), os.path.abspath(slnk))
+		except OSError:
+			pass
+		i+=1
+	# run avconv
+	cmd = 'avconv -r {0} -i {1}/img%06d.jpg -vcodec libx264 -crf 26 -g 15 -vf scale=576:352 -y {1}/vid.mp4'.format(fps, dir)
+	try:
+		log('Encoding video {0}'.format(dir))
+                subprocess.check_call(cmd.split(), shell=False)
+        except subprocess.CalledProcessError:
+                print 'Encoding failed.'
+        except OSError:
+                print 'Error running avconv. Run apt-get install libav-tools.'
+	# remove symlinks
+	slnks=glob.glob('{0}/img*.jpg'.format(dir))
+	for slnk in slnks:
+		log('remove symlink {0}'.format(slnk))
+		try:
+			os.remove(slnk)
+		except OSError:
+			pass
+
 runBGThread=False
 def bgThread(timeLapse, dir, imgPrefix, imgExt):
 	global runBGThread
+	log('Starting bgThread {0}'.format(dir))
 	while runBGThread:
 		try:
 			renameCapturedFiles(dir, imgPrefix, imgExt)
@@ -82,14 +114,14 @@ def bgThread(timeLapse, dir, imgPrefix, imgExt):
 			 	time.sleep(timeLapse*4)
 				# if no more images were captured even after sleeping, exit this thread
 				if len(sorted(glob.glob('{0}/*{1}'.format(dir, imgExt)))) == cImages:
-					return
+					break
 				continue
 			prevImg = None
 			for img in images:
 				if not runBGThread:
 					renameCapturedFiles(dir, imgPrefix, imgExt)
-					return
-				if prevImg: 
+					break
+				if prevImg:
 					if cmpImages(prevImg, img):
 						# img is similar to prevImg, delete prevImg
 						os.remove(prevImg)
@@ -101,10 +133,15 @@ def bgThread(timeLapse, dir, imgPrefix, imgExt):
 				prevImg = img
 		except Exception, ex:
 			print "Exception in bgThread: {0} - {1}".format(type(ex).__name__, ex)
+	encodeTimelapseVideo(dir, 7)
+	log('Ending bgThread {0}'.format(dir))
+	# end bgThread
 
 noirOptimization = '-ex night -drc high'
+flipImage = '-hf -vf'
 def captureImages(storageRoot, timeLapse=15):
 	global runBGThread
+	threadObj = None
 	bgThreadDir = None
 	filePrefix = 'img'
 	fileExt = '.jpeg'
@@ -112,10 +149,13 @@ def captureImages(storageRoot, timeLapse=15):
 		try:
 			freeDiskSpace(storageRoot) # free disk space before starting capture
 			dt = datetime.datetime.now()
-			runDuration = 86400 - (dt.hour*3600 + dt.minute*60 + dt.second)
+			timeLeft = 86400 - (dt.hour*3600 + dt.minute*60 + dt.second)
+			runDuration = 600 # 10 min
+			if timeLeft < runDuration:
+				runDuration = timeLeft
 			# capture atleast 1 shot in a run
 			if timeLapse > runDuration:
-				timeLapse = runDuration				
+				timeLapse = runDuration
 			# start a run
 			currentDirname = '{0}/{1}'.format(storageRoot, dt.date().strftime('%Y%m%d'))
 			initializeDir(currentDirname)
@@ -123,12 +163,13 @@ def captureImages(storageRoot, timeLapse=15):
 				timeLapse*1000, runDuration*1000, '{0}/{1}%05d{2}'.format(currentDirname, filePrefix, fileExt))
 			proc = subprocess.Popen(cmdline.split() + noirOptimization.split(), shell=False)
 			log('Capturing images (pid={0}) to {1}'.format(proc.pid, currentDirname))
-			if currentDirname != bgThreadDir:
+			if (currentDirname != bgThreadDir) or (threadObj is None) or (not threadObj.isAlive()):
 				# if we are capturing in a different directory than bgThreadDir, start a new thread
 				# this thread will auto-exit when there are no new images being captured for currentDirname
 				runBGThread = True
 				bgThreadDir = currentDirname
-				threading.Thread(target=bgThread, args=[timeLapse, bgThreadDir, filePrefix, fileExt]).start()
+				threadObj = threading.Thread(target=bgThread, args=[timeLapse, bgThreadDir, filePrefix, fileExt])
+				threadObj.start()
 			time.sleep(runDuration)
 			killProc(proc)
 		except KeyboardInterrupt:
@@ -138,7 +179,7 @@ def captureImages(storageRoot, timeLapse=15):
  			return
 
 def captureVideo(storageRoot, captureSpeed, videoStabilization):
-	filePrefix = 'vid'	
+	filePrefix = 'vid'
 	fileExt = '.h264'
 	while True:
 		try:
@@ -175,7 +216,7 @@ if __name__ == '__main__':
 	parser.add_argument('-vs', action='store_true', default=False, help='Turn on video stabilization')
 	args = parser.parse_args()
 	logOnConsole = args.l
-	storageRoot = args.d	
+	storageRoot = args.d
 	if args.v:
 		captureVideo(storageRoot, args.vf, args.vs)
 	elif args.t:
